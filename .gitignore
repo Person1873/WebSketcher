@@ -2,3 +2,5 @@ node_modules/
 dist/
 *.tar
 *.tar.gz
+test/renders/
+test/diffs/
