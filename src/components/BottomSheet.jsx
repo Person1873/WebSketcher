@@ -2,7 +2,7 @@ import { C } from '../geometry/analysis.js';
 import { BTN_SMALL } from './styles.js';
 import ConstraintList from './ConstraintList.jsx';
 
-export default function BottomSheet({isOpen, onToggle, sk, sel, onDelete, onToggleLocked, onToggleDisabled, onEdit, onCam}) {
+export default function BottomSheet({isOpen, onToggle, sk, sel, onDelete, onToggleLocked, onToggleDisabled, onToggleDriven, onEdit, onCam}) {
   const ptCount=sk.points.size-5, lnCount=sk.lines.size-2, ciCount=sk.circles.size;
   const cCount=sk.constraints.length;
   const disabledCount=sk.constraints.filter(c=>c.disabled).length;
@@ -33,7 +33,7 @@ export default function BottomSheet({isOpen, onToggle, sk, sel, onDelete, onTogg
         <div style={{flex:1,overflow:'hidden',display:'flex',flexDirection:'column'}}>
           <ConstraintList sk={sk} sel={sel}
             onDelete={onDelete} onToggleLocked={onToggleLocked}
-            onToggleDisabled={onToggleDisabled} onEdit={onEdit}/>
+            onToggleDisabled={onToggleDisabled} onToggleDriven={onToggleDriven} onEdit={onEdit}/>
         </div>
       )}
     </div>

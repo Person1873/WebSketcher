@@ -113,6 +113,6 @@ export function geomColor(entity, isSel, sk, states, dimmed=false) {
 export const CICONS = {
   fixed:'⚓',horizontal:'—',vertical:'|',coincident:'⊙',equal:'=',parallel:'∥',
   perpendicular:'⊥',distance:'↔',radius:'R',angle:'∠',tangent:'⌒',symmetric:'⇔',
-  point_on_line:'∈',point_on_circle:'◎',
+  point_on_line:'∈',point_on_circle:'◎',point_on_arc:'⌢',
   attach:'⊙',
 };

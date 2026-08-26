@@ -1,5 +1,6 @@
-export function arcDrawFlags(arc) {
-  const sa=arc.startAngle, ea=arc.endAngle;
+export function arcDrawFlags(arc, sa, ea) {
+  if (sa === undefined) sa = arc.startAngle;
+  if (ea === undefined) ea = arc.endAngle;
   const span=((ea-sa)+2*Math.PI)%(2*Math.PI);
   let inverted=arc.inverted;
   if(arc.throughPt){

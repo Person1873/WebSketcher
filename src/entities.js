@@ -5,16 +5,22 @@ export class SketchPoint {
     this.id=genId(); this.x=x; this.y=y; this.construction=construction;
     this.reserved=reserved; this.name=name; this.lines=new Set(); this.circles=new Set();
     this._constraints=new Set(); this._sketch=null; this.type='point';
+    this._consumedDof=new Map();
+  }
+  get dof() {
+    if (this.reserved) return 0;
+    let c=0; for (const v of this._consumedDof.values()) c+=v; return 2-c;
   }
   get constraints(){ return this._constraints; }
   delete() {
-    if (!this._sketch||this.reserved) return;
-    this._sketch._beginBatch();
+    if (!this._sketch || this.reserved) return;
+    const sk = this._sketch; this._sketch = null;
+    sk._beginBatch();
     for (const ln of [...this.lines])   ln.delete();
     for (const ci of [...this.circles]) ci.delete();
     for (const c  of [...this._constraints]) c._refDeleted(this);
-    this._sketch.points.delete(this.id);
-    this._sketch._endBatch();
+    sk.points.delete(this.id);
+    sk._endBatch();
   }
 }
 
@@ -26,14 +32,17 @@ export class SketchLine {
   }
   get length(){ return Math.sqrt((this.p2.x-this.p1.x)**2+(this.p2.y-this.p1.y)**2); }
   get midpoint(){ return {x:(this.p1.x+this.p2.x)/2, y:(this.p1.y+this.p2.y)/2}; }
+  // Lines have no intrinsic DOF — derived from their endpoints for display purposes
+  get dof(){ return this.p1.dof + this.p2.dof; }
   get constraints(){ return this._constraints; }
   delete() {
     if (!this._sketch) return;
-    this._sketch._beginBatch();
+    const sk = this._sketch; this._sketch = null;
+    sk._beginBatch();
     this.p1.lines.delete(this); this.p2.lines.delete(this);
     for (const c of [...this._constraints]) c._refDeleted(this);
-    this._sketch.lines.delete(this.id);
-    this._sketch._endBatch();
+    sk.lines.delete(this.id);
+    sk._endBatch();
   }
 }
 
@@ -41,16 +50,20 @@ export class SketchCircle {
   constructor(centre, radius, {construction=false,name=null}={}) {
     this.id=genId(); this.centre=centre; this.radius=radius; this.construction=construction;
     this.name=name; this._constraints=new Set(); this._sketch=null; this.type='circle';
+    this._consumedDof=new Map();
     centre.circles.add(this);
   }
+  // Own DOF = radius slot only; centre position is tracked via the centre point
+  get dof(){ let c=0; for (const v of this._consumedDof.values()) c+=v; return 1-c; }
   get constraints(){ return this._constraints; }
   delete() {
     if (!this._sketch) return;
-    this._sketch._beginBatch();
+    const sk = this._sketch; this._sketch = null;
+    sk._beginBatch();
     this.centre.circles.delete(this);
     for (const c of [...this._constraints]) c._refDeleted(this);
-    this._sketch.circles.delete(this.id);
-    this._sketch._endBatch();
+    sk.circles.delete(this.id);
+    sk._endBatch();
   }
 }
 
@@ -61,28 +74,37 @@ export class SketchArc {
     this.throughPt=null;
     this.construction=construction; this.name=name;
     this._constraints=new Set(); this._sketch=null; this.type='arc';
+    this._consumedDof=new Map();
     centre.circles.add(this);
     startPt.circles.add(this);
     endPt.circles.add(this);
   }
   get startAngle(){ return Math.atan2(this.startPt.y-this.centre.y, this.startPt.x-this.centre.x); }
   get endAngle(){   return Math.atan2(this.endPt.y-this.centre.y,   this.endPt.x-this.centre.x); }
+  // Own DOF = radius slot only; start/endPt each have 1 DOF consumed at arc creation (arc-internal)
+  get dof(){ let c=0; for (const v of this._consumedDof.values()) c+=v; return 1-c; }
   get constraints(){ return this._constraints; }
   delete() {
     if (!this._sketch) return;
-    this._sketch._beginBatch();
+    const sk = this._sketch; this._sketch = null;
+    sk._beginBatch();
     this.centre.circles.delete(this);
     this.startPt.circles.delete(this);
     this.endPt.circles.delete(this);
+    // Release arc-internal DOF consumed on startPt/endPt at creation
+    this.startPt._consumedDof.delete(this);
+    this.endPt._consumedDof.delete(this);
     for (const c of [...this._constraints]) c._refDeleted(this);
-    this._sketch.arcs.delete(this.id);
-    this._sketch._endBatch();
+    sk.arcs.delete(this.id);
+    sk._endBatch();
   }
 }
 
 export function deleteArcWithDeps(arc, sk) {
   const centre = arc.centre;
+  const throughPt = arc.throughPt;
   const arcPts = new Set([arc.startPt, arc.endPt]);
+  if (throughPt) arcPts.add(throughPt);
   for (const c of sk.constraints)
     if (c.type==='point_on_circle' && c.refs[1]===arc) arcPts.add(c.refs[0]);
 
@@ -96,14 +118,14 @@ export function deleteArcWithDeps(arc, sk) {
   sk.deleteEntity(arc);
   for (const sp of spokes) if (sk.lines.has(sp.id)) sk.deleteEntity(sp);
 
-  if (!centre.reserved && sk.points.has(centre.id)) {
-    const inUse =
-      [...sk.lines.values()].some(l => l.p1===centre || l.p2===centre) ||
-      [...sk.circles.values()].some(c => c.centre===centre) ||
-      [...sk.arcs.values()].some(a => a.centre===centre || a.startPt===centre || a.endPt===centre) ||
-      centre._constraints.size > 0;
-    if (!inUse) sk.deleteEntity(centre);
-  }
+  const ptOrphaned = p => !p.reserved && sk.points.has(p.id) &&
+    ![...sk.lines.values()].some(l => l.p1===p || l.p2===p) &&
+    ![...sk.circles.values()].some(c => c.centre===p) &&
+    ![...sk.arcs.values()].some(a => a.centre===p || a.startPt===p || a.endPt===p) &&
+    p._constraints.size === 0;
+
+  if (ptOrphaned(centre)) sk.deleteEntity(centre);
+  if (throughPt && ptOrphaned(throughPt)) sk.deleteEntity(throughPt);
   sk._endBatch();
 }
 

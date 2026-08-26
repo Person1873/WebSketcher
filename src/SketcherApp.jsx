@@ -115,6 +115,7 @@ export default function SketcherApp() {
   },[constraintError]); // eslint-disable-line
   const [resolutions, setResolutions] = useState([]);
   const [selectedRes, setSelectedRes] = useState(0);
+  const [clearCount, setClearCount] = useState(0);
   useEffect(()=>{
     if(!sk.conflictState){ setResolutions([]); setSelectedRes(0); return; }
     setResolutions(findResolutions(sk));
@@ -290,7 +291,16 @@ export default function SketcherApp() {
     pts.forEach(({pt,entity})=>{ const p=projectOnEntity(entity,cx,cy); pt.x=p.x; pt.y=p.y; });
 
     const r=pts.reduce((s,{pt})=>s+Math.sqrt((pt.x-cx)**2+(pt.y-cy)**2),0)/pts.length||10;
-    const p0=pts[0].pt, pN=pts[pts.length-1].pt;
+    let p0=pts[0].pt, pN=pts[pts.length-1].pt;
+    if(pts.length===3){
+      // Swap start/end so CCW arc contains the middle tangent point (throughPt)
+      const sa3=Math.atan2(p0.y-cy, p0.x-cx);
+      const ea3=Math.atan2(pN.y-cy, pN.x-cx);
+      const ta3=Math.atan2(pts[1].pt.y-cy, pts[1].pt.x-cx);
+      const sp3=((ea3-sa3)+2*Math.PI)%(2*Math.PI);
+      const midOnCCW=((ta3-sa3)+2*Math.PI)%(2*Math.PI)<=sp3;
+      if(!midOnCCW){ const tmp=p0; p0=pN; pN=tmp; }
+    }
     sk._beginBatch();
     const Cpt=sk._mkPt(cx,cy,{construction:true,name:'Arc centre'});
     const a=sk._mkAr(Cpt,r,p0,pN,{inverted:false});
@@ -298,7 +308,7 @@ export default function SketcherApp() {
     pts.forEach(({pt,entity})=>{
       addPointOnEntity(sk,pt,entity);
       sk._mkC('tangent',[a,entity]);
-      sk._mkC('point_on_circle',[pt,a]);
+      sk._mkC('point_on_arc',[pt,a]);
     });
     sk._endBatch();
     sk._solveAndNotify();
@@ -353,7 +363,7 @@ export default function SketcherApp() {
     if(e.button===2){ lineStartRef.current=null; circleCenterRef.current=null; rerender(); return; }
     const w=getWorld(e);
     const snapR=18/cam.scale;
-    if(conflict) return;
+    if(conflict && tool!=='select') return;
     if(e.altKey){ panRef.current={active:true,sx:e.clientX,sy:e.clientY,tx:cam.tx,ty:cam.ty}; e.currentTarget.setPointerCapture(e.pointerId); return; }
     const hit=pick(w.x,w.y,sk,snapR);
 
@@ -372,7 +382,33 @@ export default function SketcherApp() {
         const ent=hit.entity;
         const s=new Set(sel); s.has(ent.id)?s.delete(ent.id):s.add(ent.id); setSel(s);
         if(s.has(ent.id)){
-          dragRef.current={active:true,mode:'radius',entity:ent,startRadius:ent.radius};
+          if(hit.type==='arc'){
+            const hasR=[...(ent._constraints??[])].some(c=>c.type==='radius'&&!c.disabled);
+            if(hasR){
+              dragRef.current={active:true,mode:'arc',arc:ent,startWorld:{x:w.x,y:w.y},
+                startCentre:{x:ent.centre.x,y:ent.centre.y},
+                startP1:{x:ent.startPt.x,y:ent.startPt.y},
+                startP2:{x:ent.endPt.x,y:ent.endPt.y},
+                startThrough:ent.throughPt?{x:ent.throughPt.x,y:ent.throughPt.y}:null};
+            } else {
+              const startDist=Math.hypot(w.x-ent.centre.x,w.y-ent.centre.y);
+              const sa=Math.atan2(ent.startPt.y-ent.centre.y,ent.startPt.x-ent.centre.x);
+              const ea=Math.atan2(ent.endPt.y-ent.centre.y,  ent.endPt.x-ent.centre.x);
+              const ta=ent.throughPt?Math.atan2(ent.throughPt.y-ent.centre.y,ent.throughPt.x-ent.centre.x):null;
+              dragRef.current={active:true,mode:'arc_radius',arc:ent,startWorld:{x:w.x,y:w.y},
+                startRadius:ent.radius,startDist,sa,ea,ta};
+            }
+          } else {
+            dragRef.current={active:true,mode:'radius',entity:ent,startRadius:ent.radius};
+          }
+          e.currentTarget.setPointerCapture(e.pointerId);
+        }
+      } else if(hit?.type==='line' && !hit.entity.construction){
+        const ln=hit.entity;
+        const s=new Set(sel); s.has(ln.id)?s.delete(ln.id):s.add(ln.id); setSel(s);
+        if(s.has(ln.id)){
+          dragRef.current={active:true,mode:'line',line:ln,startWorld:{x:w.x,y:w.y},
+            startP1:{x:ln.p1.x,y:ln.p1.y},startP2:{x:ln.p2.x,y:ln.p2.y}};
           e.currentTarget.setPointerCapture(e.pointerId);
         }
       } else if(hit){
@@ -386,64 +422,106 @@ export default function SketcherApp() {
     }
     if(tool==='point'){
       const _near=snapToPoint(w.x,w.y,sk,snapR);
-      const pt=sk.addPoint(_near?.x??w.x,_near?.y??w.y); if(!pt) return;
-      autoConstrainNewPoint(pt,sk,snapR);
+      sk._beginBatch();
+      const pt=sk.addPoint(_near?.x??w.x,_near?.y??w.y);
+      if(pt) autoConstrainNewPoint(pt,sk,snapR);
+      sk._endBatch();
+      if(!pt) return;
       return;
     }
     if(tool==='line'){
-      const _near=snapToPoint(w.x,w.y,sk,snapR);
-      const pt=sk.addPoint(_near?.x??w.x,_near?.y??w.y); if(!pt) return;
-      autoConstrainNewPoint(pt,sk,snapR);
+      const snap=snapToPoint(w.x,w.y,sk,snapR);
+      const wx=snap?.x??w.x, wy=snap?.y??w.y;
       const ls=lineStartRef.current;
-      if(!ls){ lineStartRef.current=pt; rerender(); }
-      else{ sk.addLine({p1:ls,p2:pt}); lineStartRef.current=pt; }
+      if(!ls){ lineStartRef.current={x:wx,y:wy,pt:snap??null}; rerender(); return; }
+      sk._beginBatch();
+      const p1=ls.pt??sk.addPoint(ls.x,ls.y);
+      if(p1&&!ls.pt) autoConstrainNewPoint(p1,sk,snapR);
+      const p2=snap??sk.addPoint(wx,wy);
+      if(p2&&!snap) autoConstrainNewPoint(p2,sk,snapR);
+      const ln=(p1&&p2)?sk.addLine({p1,p2}):null;
+      sk._endBatch();
+      if(ln&&p2) lineStartRef.current={x:p2.x,y:p2.y,pt:p2};
+      else lineStartRef.current=null;
       return;
     }
     if(tool==='circle'){
       const cc=circleCenterRef.current;
       if(!cc){
         const _near=snapToPoint(w.x,w.y,sk,snapR);
-        const pt=sk.addPoint(_near?.x??w.x,_near?.y??w.y); if(!pt) return;
-        autoConstrainNewPoint(pt,sk,snapR);
+        sk._beginBatch();
+        const pt=sk.addPoint(_near?.x??w.x,_near?.y??w.y);
+        if(pt) autoConstrainNewPoint(pt,sk,snapR);
+        sk._endBatch();
+        if(!pt) return;
         circleCenterRef.current=pt; rerender();
       } else {
         const _near=snapToPoint(w.x,w.y,sk,snapR);
-        const pt=sk.addPoint(_near?.x??w.x,_near?.y??w.y); if(!pt) return;
+        sk._beginBatch();
+        const pt=sk.addPoint(_near?.x??w.x,_near?.y??w.y);
+        sk._endBatch();
+        if(!pt) return;
         const r=Math.sqrt((pt.x-cc.x)**2+(pt.y-cc.y)**2);
         if(r>1){
           const ci=sk.addCircle({centre:cc,radius:r});
           if(ci){
+            sk._beginBatch();
             sk.addConstraint('point_on_circle',[pt,ci]);
             autoConstrainNewPoint(pt,sk,snapR);
+            sk._endBatch();
           }
         }
         circleCenterRef.current=null;
       }
     }
     if(tool==='centerArc'){
-      const _near=snapToPoint(w.x,w.y,sk,snapR);
-      const pt=sk.addPoint(_near?.x??w.x,_near?.y??w.y); if(!pt) return;
-      autoConstrainNewPoint(pt,sk,snapR);
       const arc=arcRef.current;
+      if(arc?.endPt){
+        // Step 4: project click onto arc circle → throughPt for stable orientation
+        arcRef.current=null;
+        if(!sk.points.has(arc.centre.id)||!sk.points.has(arc.startPt.id)||!sk.points.has(arc.endPt.id)){
+          rerender(); return;
+        }
+        const r=Math.sqrt((arc.startPt.x-arc.centre.x)**2+(arc.startPt.y-arc.centre.y)**2);
+        if(r>1){
+          const sa=Math.atan2(arc.startPt.y-arc.centre.y, arc.startPt.x-arc.centre.x);
+          const ea=Math.atan2(arc.endPt.y-arc.centre.y, arc.endPt.x-arc.centre.x);
+          const span=((ea-sa)+2*Math.PI)%(2*Math.PI);
+          const ca=Math.atan2(w.y-arc.centre.y, w.x-arc.centre.x);
+          const clickOnCCW=((ca-sa)+2*Math.PI)%(2*Math.PI)<=span;
+          const inv=clickOnCCW!==(span<=Math.PI);
+          // Swap start/end so CCW span always covers the user's chosen arc side
+          const [p1,p2]=inv?[arc.endPt,arc.startPt]:[arc.startPt,arc.endPt];
+          const tpx=arc.centre.x+r*Math.cos(ca), tpy=arc.centre.y+r*Math.sin(ca);
+          const throughPt=sk._mkPt(tpx,tpy,{construction:true,name:'through'});
+          const a=sk._mkAr(arc.centre,r,p1,p2,{inverted:false});
+          a.throughPt=throughPt;
+          sk._mkLn(arc.centre,p1,{construction:true,name:'spoke'});
+          sk._mkLn(arc.centre,p2,{construction:true,name:'spoke'});
+          sk._mkC('point_on_arc',[throughPt,a]).scale=0.5;
+          sk._solveAndNotify();
+          setSel(new Set([a.id])); activateTool('select');
+        }
+        return;
+      }
+      const _near=snapToPoint(w.x,w.y,sk,snapR);
+      sk._beginBatch();
+      const pt=sk.addPoint(_near?.x??w.x,_near?.y??w.y);
+      if(pt) autoConstrainNewPoint(pt,sk,snapR);
+      sk._endBatch();
+      if(!pt) return;
       if(!arc){ arcRef.current={centre:pt}; rerender(); return; }
       if(!arc.startPt){ arcRef.current={...arc,startPt:pt}; rerender(); return; }
-      const r=Math.sqrt((arc.startPt.x-arc.centre.x)**2+(arc.startPt.y-arc.centre.y)**2);
-      if(r>1){
-        const a=sk._mkAr(arc.centre,r,arc.startPt,pt,{inverted:false});
-        const s1=sk._mkLn(arc.centre,arc.startPt,{construction:true,name:'spoke'});
-        const s2=sk._mkLn(arc.centre,pt,{construction:true,name:'spoke'});
-        sk._mkC('equal',[s1,s2]);
-        sk._mkC('point_on_circle',[arc.startPt,a]);
-        sk._mkC('point_on_circle',[pt,a]);
-        sk._solveAndNotify();
-        setSel(new Set([a.id])); activateTool('select');
-      }
-      arcRef.current=null;
+      // Step 3: store end point, await side indicator click
+      arcRef.current={...arc,endPt:pt}; rerender(); return;
     }
     if(tool==='3pArc'){
       const _near=snapToPoint(w.x,w.y,sk,snapR);
-      const pt=sk.addPoint(_near?.x??w.x,_near?.y??w.y); if(!pt) return;
-      autoConstrainNewPoint(pt,sk,snapR);
+      sk._beginBatch();
+      const pt=sk.addPoint(_near?.x??w.x,_near?.y??w.y);
+      if(pt) autoConstrainNewPoint(pt,sk,snapR);
+      sk._endBatch();
+      if(!pt) return;
       const arc=arcRef.current;
       if(!arc){ arcRef.current={p1:pt}; rerender(); return; }
       if(!arc.p2){ arcRef.current={...arc,p2:pt}; rerender(); return; }
@@ -451,16 +529,18 @@ export default function SketcherApp() {
       if(cc){
         const Cpt=sk._mkPt(cc.x,cc.y,{construction:true,name:'Arc centre'});
         const r=Math.sqrt((arc.p1.x-cc.x)**2+(arc.p1.y-cc.y)**2);
-        const s1=sk._mkLn(Cpt,arc.p1,{construction:true,name:'spoke'});
-        const s2=sk._mkLn(Cpt,arc.p2,{construction:true,name:'spoke'});
-        const s3=sk._mkLn(Cpt,pt,{construction:true,name:'spoke'});
-        sk._mkC('equal',[s1,s2]);
-        sk._mkC('equal',[s1,s3]);
-        const a=sk._mkAr(Cpt,r,arc.p1,pt,{inverted:false});
+        // Swap start/end so CCW span covers the through point (p2 = middle click)
+        const sa3=Math.atan2(arc.p1.y-cc.y, arc.p1.x-cc.x);
+        const ea3=Math.atan2(pt.y-cc.y, pt.x-cc.x);
+        const span3=((ea3-sa3)+2*Math.PI)%(2*Math.PI);
+        const ta3=Math.atan2(arc.p2.y-cc.y, arc.p2.x-cc.x);
+        const p2OnCCW=((ta3-sa3)+2*Math.PI)%(2*Math.PI)<=span3;
+        const [startPt,endPt]=p2OnCCW?[arc.p1,pt]:[pt,arc.p1];
+        sk._mkLn(Cpt,startPt,{construction:true,name:'spoke'});
+        sk._mkLn(Cpt,endPt,{construction:true,name:'spoke'});
+        const a=sk._mkAr(Cpt,r,startPt,endPt,{inverted:false});
         a.throughPt=arc.p2;
-        sk._mkC('point_on_circle',[arc.p1,a]);
-        sk._mkC('point_on_circle',[arc.p2,a]);
-        sk._mkC('point_on_circle',[pt,a]);
+        sk._mkC('point_on_arc',[arc.p2,a]).scale=0.5;
         sk._solveAndNotify();
         setSel(new Set([a.id])); activateTool('select');
       }
@@ -480,8 +560,11 @@ export default function SketcherApp() {
     }
     if(tool==='3pCircle'){
       const _near=snapToPoint(w.x,w.y,sk,snapR);
-      const pt=sk.addPoint(_near?.x??w.x,_near?.y??w.y); if(!pt) return;
-      autoConstrainNewPoint(pt,sk,snapR);
+      sk._beginBatch();
+      const pt=sk.addPoint(_near?.x??w.x,_near?.y??w.y);
+      if(pt) autoConstrainNewPoint(pt,sk,snapR);
+      sk._endBatch();
+      if(!pt) return;
       const arc=arcRef.current;
       if(!arc){ arcRef.current={p1:pt}; rerender(); return; }
       if(!arc.p2){ arcRef.current={...arc,p2:pt}; rerender(); return; }
@@ -489,10 +572,9 @@ export default function SketcherApp() {
       if(cc){
         const Cpt=sk._mkPt(cc.x,cc.y,{construction:true,name:'Circle centre'});
         const r=Math.sqrt((arc.p1.x-cc.x)**2+(arc.p1.y-cc.y)**2);
-        const s1=sk._mkLn(Cpt,arc.p1,{construction:true,name:'spoke'});
-        const s2=sk._mkLn(Cpt,arc.p2,{construction:true,name:'spoke'});
-        const s3=sk._mkLn(Cpt,pt,{construction:true,name:'spoke'});
-        sk._mkC('equal',[s1,s2]); sk._mkC('equal',[s1,s3]);
+        sk._mkLn(Cpt,arc.p1,{construction:true,name:'spoke'});
+        sk._mkLn(Cpt,arc.p2,{construction:true,name:'spoke'});
+        sk._mkLn(Cpt,pt,{construction:true,name:'spoke'});
         const ci=sk._mkCi(Cpt,r);
         sk._mkC('point_on_circle',[arc.p1,ci]);
         sk._mkC('point_on_circle',[arc.p2,ci]);
@@ -506,8 +588,11 @@ export default function SketcherApp() {
       const d1=draw1Ref.current;
       if(!d1){
         const _near=snapToPoint(w.x,w.y,sk,snapR);
-        const pt=sk.addPoint(_near?.x??w.x,_near?.y??w.y); if(!pt) return;
-        autoConstrainNewPoint(pt,sk,snapR);
+        sk._beginBatch();
+        const pt=sk.addPoint(_near?.x??w.x,_near?.y??w.y);
+        if(pt) autoConstrainNewPoint(pt,sk,snapR);
+        sk._endBatch();
+        if(!pt) return;
         draw1Ref.current=pt; rerender(); return;
       }
       const d1p=d1;
@@ -563,7 +648,39 @@ export default function SketcherApp() {
     if(panRef.current.active){ cam.tx=panRef.current.tx+(e.clientX-panRef.current.sx); cam.ty=panRef.current.ty+(e.clientY-panRef.current.sy); rerender(); return; }
     if(dragRef.current.active){
       const d=dragRef.current;
-      if(d.mode==='radius'){
+      if(d.mode==='arc_radius'){
+        const curDist=Math.hypot(w.x-d.arc.centre.x,w.y-d.arc.centre.y);
+        const newR=Math.max(1,d.startRadius+(curDist-d.startDist));
+        d.arc.startPt.x=d.arc.centre.x+newR*Math.cos(d.sa);
+        d.arc.startPt.y=d.arc.centre.y+newR*Math.sin(d.sa);
+        d.arc.endPt.x=d.arc.centre.x+newR*Math.cos(d.ea);
+        d.arc.endPt.y=d.arc.centre.y+newR*Math.sin(d.ea);
+        if(d.arc.throughPt&&d.ta!==null){
+          d.arc.throughPt.x=d.arc.centre.x+newR*Math.cos(d.ta);
+          d.arc.throughPt.y=d.arc.centre.y+newR*Math.sin(d.ta);
+        }
+        sk._dragFixed  = d.arc.startPt;
+        sk._dragTarget = {x:d.arc.startPt.x,y:d.arc.startPt.y};
+        sk.markDirty();
+      } else if(d.mode==='arc'){
+        const dx=w.x-d.startWorld.x, dy=w.y-d.startWorld.y;
+        d.arc.centre.x=d.startCentre.x+dx; d.arc.centre.y=d.startCentre.y+dy;
+        d.arc.startPt.x=d.startP1.x+dx; d.arc.startPt.y=d.startP1.y+dy;
+        d.arc.endPt.x=d.startP2.x+dx;   d.arc.endPt.y=d.startP2.y+dy;
+        if(d.arc.throughPt && d.startThrough){
+          d.arc.throughPt.x=d.startThrough.x+dx; d.arc.throughPt.y=d.startThrough.y+dy;
+        }
+        sk._dragFixed  = d.arc.centre;
+        sk._dragTarget = {x:d.arc.centre.x, y:d.arc.centre.y};
+        sk.markDirty();
+      } else if(d.mode==='line'){
+        const dx=w.x-d.startWorld.x, dy=w.y-d.startWorld.y;
+        d.line.p1.x=d.startP1.x+dx; d.line.p1.y=d.startP1.y+dy;
+        d.line.p2.x=d.startP2.x+dx; d.line.p2.y=d.startP2.y+dy;
+        sk._dragFixed  = d.line.p1;
+        sk._dragTarget = {x:d.line.p1.x, y:d.line.p1.y};
+        sk.markDirty();
+      } else if(d.mode==='radius'){
         const c=d.entity.centre;
         const dx=w.x-c.x, dy=w.y-c.y;
         d.entity.radius=Math.max(1,Math.sqrt(dx*dx+dy*dy));
@@ -572,9 +689,17 @@ export default function SketcherApp() {
         const{pt,startWorld,startPtPos}=d;
         const tx = startPtPos.x+(w.x-startWorld.x);
         const ty = startPtPos.y+(w.y-startWorld.y);
+        const pdx = tx - pt.x, pdy = ty - pt.y;
         pt.x = tx; pt.y = ty;
         sk._dragFixed  = pt;
         sk._dragTarget = {x: tx, y: ty};
+        for (const arc of sk.arcs.values()) {
+          if (arc.centre === pt) {
+            arc.startPt.x += pdx; arc.startPt.y += pdy;
+            arc.endPt.x   += pdx; arc.endPt.y   += pdy;
+            if (arc.throughPt) { arc.throughPt.x += pdx; arc.throughPt.y += pdy; }
+          }
+        }
         dbg(`drag handler: pt=${pt.id} target=(${tx.toFixed(1)},${ty.toFixed(1)})`);
         for (const c of (pt._constraints ?? [])) {
           if ((c.type==='point_on_circle') && !c.disabled) {
@@ -634,11 +759,13 @@ export default function SketcherApp() {
     dragRef.current={active:false,pt:null,startWorld:null,startPtPos:null};
     panRef.current={active:false,sx:0,sy:0,tx:0,ty:0};
     setSel(new Set()); setSheetOpen(false); setShowConfirm(false);
+    setClearCount(n=>n+1);
     doc._notify();
+    StorageAdapter.save(doc);
   };
 
   const onConstraint=useCallback((type, activeOverride=null)=>{
-    if(conflict) return;
+    if(conflict) sk.undo();
     const resolved = type==='dimension' ? (activeOverride??dimType) : type;
     const result=applyConstraintFromSelection(resolved,sk,sel);
     if(result?.needsInput) setDimPending(result);
@@ -662,7 +789,7 @@ export default function SketcherApp() {
     conflict?'Conflict — tap ↩ to undo':
     tool==='line'?(lineStartRef.current?'Tap endpoint · right-tap to stop':'Tap to start line'):
     tool==='circle'?(circleCenterRef.current?'Tap to set radius':'Tap centre point'):
-    tool==='centerArc'?(!arcRef.current?'Tap arc centre':!arcRef.current?.startPt?'Tap start point':'Tap end point'):
+    tool==='centerArc'?(!arcRef.current?'Tap arc centre':!arcRef.current?.startPt?'Tap start point':!arcRef.current?.endPt?'Tap end point':'Tap to choose arc side'):
     tool==='3pArc'?(!arcRef.current?'Tap point 1':!arcRef.current?.p2?'Tap point 2':'Tap point 3 on arc'):
     tool==='3pCircle'?(!arcRef.current?'Tap point 1':!arcRef.current?.p2?'Tap point 2':'Tap point 3 on circle'):
     tool==='tangentArc'?(!arcRef.current?.pts?.length?'Tap a line, arc, or circle':'arcRef.current.pts.length===1?"Tap entity 2 · Done after":"Tap entity 3 or Done"'):
@@ -732,6 +859,36 @@ export default function SketcherApp() {
           <rect width="100%" height="100%" fill={C.bg}/>
           <GridLines cam={cam} W={dims.W} H={dims.H}/>
 
+          {doc.sortedPages.filter(p=>p.id!==doc.activePage&&p.visible).map(page=>{
+            const psk=page.sketch; if(!psk) return null;
+            const {color,lineWeight,lineDash}=page.style;
+            const da=lineDash?.length?lineDash.join(' '):undefined;
+            const elems=[];
+            for(const ln of psk.lines.values()){
+              if(psk.reserved.has(ln)) continue;
+              const s1=cam.toScreen(ln.p1.x,ln.p1.y), s2=cam.toScreen(ln.p2.x,ln.p2.y);
+              elems.push(<line key={ln.id} x1={s1.x} y1={s1.y} x2={s2.x} y2={s2.y}
+                stroke={color} strokeWidth={lineWeight} strokeDasharray={ln.construction?'5 3':da}/>);
+            }
+            for(const ci of psk.circles.values()){
+              const sc=cam.toScreen(ci.centre.x,ci.centre.y);
+              const sr=ci.radius*cam.scale;
+              elems.push(<circle key={ci.id} cx={sc.x} cy={sc.y} r={sr}
+                fill="none" stroke={color} strokeWidth={lineWeight} strokeDasharray={ci.construction?'5 3':da}/>);
+            }
+            for(const a of psk.arcs.values()){
+              const _sa=a.startAngle, _ea=a.endAngle;
+              const ss=cam.toScreen(a.centre.x+a.radius*Math.cos(_sa),a.centre.y+a.radius*Math.sin(_sa));
+              const se=cam.toScreen(a.centre.x+a.radius*Math.cos(_ea),a.centre.y+a.radius*Math.sin(_ea));
+              const sr=a.radius*cam.scale;
+              const {largeArc,sweepFlag}=arcDrawFlags(a);
+              elems.push(<path key={a.id}
+                d={`M ${ss.x} ${ss.y} A ${sr} ${sr} 0 ${largeArc} ${sweepFlag} ${se.x} ${se.y}`}
+                fill="none" stroke={color} strokeWidth={lineWeight} strokeDasharray={a.construction?'5 3':da}/>);
+            }
+            return <g key={page.id} opacity={0.35} style={{pointerEvents:'none'}}>{elems}</g>;
+          })}
+
           {conflict&&sk.conflictState.ghostState&&(()=>{
             const gs=sk.conflictState.ghostState;
             const gpt=id=>gs[id]??null;
@@ -753,10 +910,12 @@ export default function SketcherApp() {
             }
             for(const a of sk.arcs.values()){
               const cP=gpt(a.centre.id)||a.centre;
-              const sP=gpt(a.startPt.id)||a.startPt;
-              const eP=gpt(a.endPt.id)||a.endPt;
-              const sr=cam.toScreen(sP.x,sP.y), se=cam.toScreen(eP.x,eP.y);
-              const rad=(gs[a.id]?.r??a.radius)*cam.scale;
+              const _r=gs[a.id]?.r??a.radius;
+              const _sa=Math.atan2((gpt(a.startPt.id)||a.startPt).y-cP.y,(gpt(a.startPt.id)||a.startPt).x-cP.x);
+              const _ea=Math.atan2((gpt(a.endPt.id)||a.endPt).y-cP.y,(gpt(a.endPt.id)||a.endPt).x-cP.x);
+              const sr=cam.toScreen(cP.x+_r*Math.cos(_sa),cP.y+_r*Math.sin(_sa));
+              const se=cam.toScreen(cP.x+_r*Math.cos(_ea),cP.y+_r*Math.sin(_ea));
+              const rad=_r*cam.scale;
               const {largeArc:la,sweepFlag:sf}=arcDrawFlags(a);
               ge.push(<path key={`g${a.id}`}
                 d={`M ${sr.x} ${sr.y} A ${rad} ${rad} 0 ${la} ${sf} ${se.x} ${se.y}`}
@@ -764,7 +923,7 @@ export default function SketcherApp() {
             }
             return <g>{ge}</g>;
           })()}
-          <SketchView sk={sk} cam={cam} sel={sel}
+          <SketchView key={clearCount} sk={sk} cam={cam} sel={sel}
             lineStart={lineStartRef.current} circleCenter={circleCenterRef.current}
             mouseWorld={mouseWorld} W={dims.W} H={dims.H}
             selectMode={selectMode}
@@ -773,7 +932,7 @@ export default function SketcherApp() {
             }}/>
 
           {tool==='centerArc'&&arcRef.current&&mouseWorld&&(()=>{
-            const{centre,startPt}=arcRef.current;
+            const{centre,startPt,endPt}=arcRef.current;
             const sc=cam.toScreen(centre.x,centre.y);
             if(!startPt){
               const sm=cam.toScreen(mouseWorld.x,mouseWorld.y);
@@ -783,21 +942,47 @@ export default function SketcherApp() {
             const r=Math.sqrt((startPt.x-centre.x)**2+(startPt.y-centre.y)**2);
             if(r<1) return null;
             const sr=r*cam.scale;
-            const ma=Math.atan2(mouseWorld.y-centre.y, mouseWorld.x-centre.x);
-            const sa=Math.atan2(startPt.y-centre.y, startPt.x-centre.x);
-            const ex=centre.x+r*Math.cos(ma), ey=centre.y+r*Math.sin(ma);
-            const span=((ma-sa)+2*Math.PI)%(2*Math.PI);
-            const sweepFlag=span<=Math.PI?0:1;
             const ss=cam.toScreen(startPt.x,startPt.y);
-            const se=cam.toScreen(ex,ey);
+            if(!endPt){
+              // Step 2→3: arc to mouse position
+              const ma=Math.atan2(mouseWorld.y-centre.y, mouseWorld.x-centre.x);
+              const sa=Math.atan2(startPt.y-centre.y, startPt.x-centre.x);
+              const ex=centre.x+r*Math.cos(ma), ey=centre.y+r*Math.sin(ma);
+              const span=((ma-sa)+2*Math.PI)%(2*Math.PI);
+              const sweepFlag=span<=Math.PI?0:1;
+              const se=cam.toScreen(ex,ey);
+              return <>
+                <circle cx={sc.x} cy={sc.y} r={sr}
+                  fill="none" stroke={C.construction} strokeWidth={1}
+                  strokeDasharray="3 3" opacity={0.25}/>
+                <path d={`M ${ss.x} ${ss.y} A ${sr} ${sr} 0 0 ${sweepFlag} ${se.x} ${se.y}`}
+                  fill="none" stroke={C.geom} strokeWidth={2}
+                  strokeDasharray="5 3" opacity={0.75}/>
+                <circle cx={se.x} cy={se.y} r={5} fill={C.geom} opacity={0.7}/>
+              </>;
+            }
+            // Step 3→4: arc fixed, mouse picks which side
+            const sa=Math.atan2(startPt.y-centre.y, startPt.x-centre.x);
+            const ea=Math.atan2(endPt.y-centre.y, endPt.x-centre.x);
+            const span=((ea-sa)+2*Math.PI)%(2*Math.PI);
+            const ca=Math.atan2(mouseWorld.y-centre.y, mouseWorld.x-centre.x);
+            const clickOnCCW=((ca-sa)+2*Math.PI)%(2*Math.PI)<=span;
+            const shortIsCCW=span<=Math.PI;
+            const inv=clickOnCCW!==shortIsCCW;
+            const drawCCW=inv?!shortIsCCW:shortIsCCW;
+            const largeArc=inv?1:0;
+            const sweepFlag=drawCCW?0:1;
+            const se=cam.toScreen(endPt.x,endPt.y);
             return <>
               <circle cx={sc.x} cy={sc.y} r={sr}
                 fill="none" stroke={C.construction} strokeWidth={1}
                 strokeDasharray="3 3" opacity={0.25}/>
-              <path d={`M ${ss.x} ${ss.y} A ${sr} ${sr} 0 0 ${sweepFlag} ${se.x} ${se.y}`}
+              <path d={`M ${ss.x} ${ss.y} A ${sr} ${sr} 0 ${inv?0:1} ${drawCCW?1:0} ${se.x} ${se.y}`}
+                fill="none" stroke={C.geom} strokeWidth={1}
+                strokeDasharray="3 3" opacity={0.2}/>
+              <path d={`M ${ss.x} ${ss.y} A ${sr} ${sr} 0 ${largeArc} ${sweepFlag} ${se.x} ${se.y}`}
                 fill="none" stroke={C.geom} strokeWidth={2}
-                strokeDasharray="5 3" opacity={0.75}/>
-              <circle cx={se.x} cy={se.y} r={5} fill={C.geom} opacity={0.7}/>
+                strokeDasharray="5 3" opacity={0.8}/>
             </>;
           })()}
 
@@ -919,51 +1104,6 @@ export default function SketcherApp() {
           </div>
         )}
 
-        {conflict&&(
-          <div style={{position:'absolute',bottom:0,left:0,right:0,zIndex:10,
-            background:'#120808',borderTop:'2px solid #662222',
-            boxShadow:'0 -8px 32px rgba(180,0,0,0.4)',padding:'12px 14px'}}>
-            <div style={{color:'#ff6666',fontSize:11,fontWeight:700,
-              letterSpacing:'0.12em',marginBottom:3}}>CONFLICT</div>
-            <div style={{color:'#cc8888',fontSize:11,fontFamily:'monospace',
-              marginBottom:10,opacity:0.85}}>
-              {sk.conflictState.trigger?.description||'Overconstrained geometry'}
-            </div>
-            <div style={{display:'flex',flexDirection:'column',gap:6,marginBottom:12}}>
-              {resolutions.map((res,i)=>(
-                <button key={i} onClick={()=>setSelectedRes(i)} style={{
-                  display:'flex',alignItems:'center',gap:10,
-                  background:selectedRes===i?'#2a0808':'transparent',
-                  border:`1px solid ${selectedRes===i?'#663333':'#2a1212'}`,
-                  borderRadius:8,padding:'9px 12px',cursor:'pointer',
-                  color:selectedRes===i?'#ffaaaa':'#664444',
-                  textAlign:'left',fontSize:11,fontFamily:'monospace'}}>
-                  <span style={{width:8,height:8,borderRadius:'50%',flexShrink:0,
-                    background:selectedRes===i?'#ff6666':'#331818'}}/>
-                  {res.primary?'↩ ':''}{res.label}{res.primary?' (undo)':''}
-                </button>
-              ))}
-              {resolutions.length===0&&(
-                <div style={{color:'#664444',fontSize:11,fontStyle:'italic'}}>
-                  No single-removal solution found — try ↩ Undo
-                </div>
-              )}
-            </div>
-            <div style={{display:'flex',gap:10}}>
-              <button onClick={()=>sk.undo()} style={{
-                flex:1,padding:'10px',borderRadius:8,cursor:'pointer',
-                background:'#1a0808',border:'1px solid #442222',
-                color:'#ff8888',fontSize:12,fontWeight:600}}>↩ Undo</button>
-              {resolutions[selectedRes]&&!resolutions[selectedRes].primary&&(
-                <button onClick={()=>applyResolution(resolutions[selectedRes])} style={{
-                  flex:1,padding:'10px',borderRadius:8,cursor:'pointer',
-                  background:'#0d2040',border:'1px solid #2a70c0',
-                  color:'#60c0ff',fontSize:12,fontWeight:600}}>Apply</button>
-              )}
-            </div>
-          </div>
-        )}
-
         {showConfirm&&(
           <ConfirmDialog
             message="Clear sketch?"
@@ -974,6 +1114,56 @@ export default function SketcherApp() {
         )}
       </div>
 
+      {conflict&&(
+        <div style={{flexShrink:0,maxHeight:'33vh',display:'flex',flexDirection:'column',
+          background:'#120808',borderTop:'2px solid #662222',
+          boxShadow:'0 -4px 16px rgba(180,0,0,0.3)'}}>
+          <div style={{padding:'10px 14px 6px',flexShrink:0}}>
+            <div style={{color:'#ff6666',fontSize:11,fontWeight:700,
+              letterSpacing:'0.12em',marginBottom:3}}>CONFLICT</div>
+            <div style={{color:'#cc8888',fontSize:11,fontFamily:'monospace',opacity:0.85}}>
+              {sk.conflictState.trigger?.description||'Overconstrained geometry'}
+            </div>
+          </div>
+          <div style={{flex:1,overflowY:'auto',padding:'4px 14px',
+            columnWidth:220,columnGap:8,columnFill:'balance'}}>
+            {resolutions.map((res,i)=>(
+              <button key={i} onClick={()=>setSelectedRes(i)} style={{
+                display:'flex',alignItems:'center',gap:10,width:'100%',
+                marginBottom:5,breakInside:'avoid',
+                background:selectedRes===i?'#2a0808':'transparent',
+                border:`1px solid ${selectedRes===i?'#663333':'#2a1212'}`,
+                borderRadius:8,padding:'8px 10px',cursor:'pointer',
+                color:selectedRes===i?'#ffaaaa':'#664444',
+                textAlign:'left',fontSize:11,fontFamily:'monospace'}}>
+                <span style={{width:8,height:8,borderRadius:'50%',flexShrink:0,
+                  background:selectedRes===i?'#ff6666':'#331818'}}/>
+                {res.primary?'↩ ':''}{res.label}{res.primary?' (undo)':''}
+              </button>
+            ))}
+            {resolutions.length===0&&(
+              <div style={{color:'#664444',fontSize:11,fontStyle:'italic',padding:'4px 0 8px'}}>
+                No single-removal solution found — try ↩ Undo
+              </div>
+            )}
+          </div>
+          <div style={{display:'flex',gap:10,padding:'8px 14px',flexShrink:0,
+            borderTop:'1px solid #2a1212'}}>
+            <button onClick={()=>sk.undo()} style={{
+              flex:1,padding:'8px',borderRadius:8,cursor:'pointer',
+              background:'#1a0808',border:'1px solid #442222',
+              color:'#ff8888',fontSize:12,fontWeight:600}}>↩ Undo</button>
+            {resolutions[selectedRes]&&!resolutions[selectedRes].primary&&(
+              <button onClick={()=>applyResolution(resolutions[selectedRes])} style={{
+                flex:1,padding:'8px',borderRadius:8,cursor:'pointer',
+                background:'#0d2040',border:'1px solid #2a70c0',
+                color:'#60c0ff',fontSize:12,fontWeight:600}}>Apply</button>
+            )}
+          </div>
+        </div>
+      )}
+
+      <div style={{position:'relative',zIndex:20,flexShrink:0,display:'flex',flexDirection:'column'}}>
       {(()=>{
         const selPts=[...sel].filter(id=>sk.points.has(id)&&!sk.points.get(id).reserved).map(id=>sk.points.get(id));
         const selLns=[...sel].filter(id=>sk.lines.has(id)&&!sk.reserved.has(sk.lines.get(id))).map(id=>sk.lines.get(id));
@@ -1243,6 +1433,7 @@ export default function SketcherApp() {
         onDelete={c=>sk.deleteConstraint(c)}
         onToggleLocked={c=>{ c.locked=!c.locked; rerender(); }}
         onToggleDisabled={c=>{ c.disabled=!c.disabled; sk._solveAndNotify(); }}
+        onToggleDriven={c=>{ c.driven=!c.driven; if(c.driven) c.updateSolvedValue?.(); sk._solveAndNotify(); }}
         onEdit={c=>{
           const lbl = c.type==='radius' ? `${c.refs[0]?.name} radius (mm):` :
                       c.type==='distance' ? `${c.refs[0]?.name} length (mm):` :
@@ -1251,8 +1442,15 @@ export default function SketcherApp() {
           setDimPending({ type:c.type, refs:c.refs, label:lbl, defaultVal:String(cur), editTarget:c });
         }}
         onCam={onCam}/>
+      </div>
 
-      {dimPending&&<DimInput pending={dimPending} onConfirm={onDimConfirm} onCancel={()=>setDimPending(null)}/>}
+      {dimPending&&<DimInput pending={dimPending} onConfirm={onDimConfirm}
+        onSetDriven={()=>{
+          if(dimPending.editTarget){ dimPending.editTarget.driven=true; dimPending.editTarget.updateSolvedValue?.(); sk._solveAndNotify(); }
+          else sk.addConstraint(dimPending.type,dimPending.refs,null,true);
+          setDimPending(null); setSel(new Set());
+        }}
+        onCancel={()=>setDimPending(null)}/>}
 
     </div>
   );

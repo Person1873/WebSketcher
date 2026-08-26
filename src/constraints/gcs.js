@@ -1,6 +1,13 @@
 export function toGcsConstraint(c) {
   if (c.disabled || c.driven) return null;
-  const r = c.refs, id = c.id, driving = !c.driven;
+  const r = c.refs, id = c.id, driving = !c.driven, scale = c.scale ?? 1;
+  const gc = _build(c, r, id, driving);
+  if (!gc) return null;
+  if (Array.isArray(gc)) return gc.map(g => ({ ...g, scale }));
+  return { ...gc, scale };
+}
+
+function _build(c, r, id, driving) {
   switch (c.type) {
     case 'coincident':      return { type: 'p2p_coincident',   id, p1_id: r[0].id, p2_id: r[1].id, driving };
     case 'horizontal':
@@ -39,14 +46,29 @@ export function toGcsConstraint(c) {
       const [a, b] = r;
       const isCurve = e => e.type === 'circle' || e.type === 'arc';
       const curve = isCurve(a) ? a : b, other = curve === a ? b : a;
-      if (other.type === 'line')
+      if (other.type === 'line') {
+        if (curve.type === 'arc') {
+          const d1 = Math.hypot(other.p1.x - curve.centre.x, other.p1.y - curve.centre.y);
+          const d2 = Math.hypot(other.p2.x - curve.centre.x, other.p2.y - curve.centre.y);
+          const nearPt = Math.abs(d1 - curve.radius) <= Math.abs(d2 - curve.radius) ? other.p1 : other.p2;
+          return [
+            { type: 'p2l_distance', id, p_id: curve.centre.id, l_id: other.id,
+              distance: { o_id: curve.id, prop: 'radius' }, driving },
+            { type: 'p2p_distance', id: id + '_ep', p1_id: nearPt.id, p2_id: curve.centre.id,
+              distance: { o_id: curve.id, prop: 'radius' }, driving },
+          ];
+        }
         return { type: 'p2l_distance', id, p_id: curve.centre.id, l_id: other.id,
                  distance: { o_id: curve.id, prop: 'radius' }, driving };
-      if (isCurve(other))
-        return { type: 'tangent_circumf', id,
-                 p1_id: a.centre.id, p2_id: b.centre.id,
-                 rd1: { o_id: a.id, prop: 'radius' }, rd2: { o_id: b.id, prop: 'radius' },
-                 internal: false, driving };
+      }
+      if (isCurve(other)) {
+        if (a.type==='arc' && b.type==='arc')
+          return { type: 'tangent_aa', id, a1_id: a.id, a2_id: b.id, driving };
+        if (a.type==='circle' && b.type==='circle')
+          return { type: 'tangent_cc', id, c1_id: a.id, c2_id: b.id, driving };
+        const circle = a.type==='circle' ? a : b, arc = circle===a ? b : a;
+        return { type: 'tangent_ca', id, c_id: circle.id, a_id: arc.id, driving };
+      }
       return null;
     }
     case 'symmetric':
@@ -58,6 +80,12 @@ export function toGcsConstraint(c) {
     case 'point_on_line':   return { type: 'point_on_line_pl', id, p_id: r[0].id, l_id: r[1].id, driving };
     case 'point_on_circle': return { type: 'p2p_distance',     id, p1_id: r[0].id, p2_id: r[1].centre.id,
                                      distance: { o_id: r[1].id, prop: 'radius' }, driving };
+    case 'point_on_arc':
+      // throughPt marker (scale < 1): radial distance only, no angular range check
+      if ((c.scale ?? 1) < 1)
+        return { type: 'p2p_distance', id, p1_id: r[0].id, p2_id: r[1].centre.id,
+                 distance: { o_id: r[1].id, prop: 'radius' }, driving };
+      return { type: 'point_on_arc', id, p_id: r[0].id, a_id: r[1].id, driving };
     case 'fixed': return null;
     default: return null;
   }

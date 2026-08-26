@@ -23,9 +23,10 @@ export function applyConstraintFromSelection(type, sk, sel) {
   }
 
   if (type==='attach') {
-    if (allPts.length>=2)              sk.addConstraint('coincident',     [allPts[0], allPts[1]]);
-    else if (pts.length&&allLns.length) sk.addConstraint('point_on_line',  [pts[0], allLns[0]]);
-    else if (pts.length&&cis.length)    sk.addConstraint('point_on_circle',[pts[0], cis[0]]);
+    if (allPts.length>=2)                       sk.addConstraint('coincident',     [allPts[0], allPts[1]]);
+    else if (allPts.length>=1 && allLns.length) sk.addConstraint('point_on_line',  [allPts[0], allLns[0]]);
+    else if (allPts.length>=1 && cis.length)    sk.addConstraint('point_on_circle',[allPts[0], cis[0]]);
+    else if (allPts.length>=1 && ars.length)    sk.addConstraint('point_on_arc',   [allPts[0], ars[0]]);
     return null;
   }
   if (type==='fixed'&&pts.length) { pts.forEach(p=>sk.addConstraint('fixed',[p])); return null; }
@@ -38,10 +39,19 @@ export function applyConstraintFromSelection(type, sk, sel) {
     if (allPts.length>=2) { sk.addConstraint('vertical',[allPts[0],allPts[1]]); return null; }
   }
   if (type==='coincident'&&allPts.length>=2) { sk.addConstraint('coincident',[allPts[0],allPts[1]]); return null; }
-  if (type==='equal'&&lns.length>=2) { sk.addConstraint('equal',[lns[0],lns[1]]); return null; }
+  if (type==='equal') {
+    if (lns.length>=2)                        { sk.addConstraint('equal',[lns[0],lns[1]]); return null; }
+    if (cis.length>=2)                        { sk.addConstraint('equal',[cis[0],cis[1]]); return null; }
+    if (ars.length>=2)                        { sk.addConstraint('equal',[ars[0],ars[1]]); return null; }
+    if (cis.length>=1&&ars.length>=1)         { sk.addConstraint('equal',[cis[0],ars[0]]); return null; }
+    return null;
+  }
   if (type==='parallel'&&allLns.length>=2) { sk.addConstraint('parallel',[allLns[0],allLns[1]]); return null; }
   if (type==='perpendicular'&&allLns.length>=2) { sk.addConstraint('perpendicular',[allLns[0],allLns[1]]); return null; }
-  if (type==='symmetric'&&pts.length>=2&&pts.length>=3) { sk.addConstraint('symmetric',[pts[0],pts[1],pts[2]]); return null; }
+  if (type==='symmetric') {
+    if (pts.length>=2 && allLns.length>=1) { sk.addConstraint('symmetric',[pts[0],pts[1],allLns[0]]); return null; }
+    if (allPts.length>=3 && pts.length>=2) { sk.addConstraint('symmetric',[allPts[0],allPts[1],allPts[2]]); return null; }
+  }
   if (type==='tangent') {
     const curves=[...cis,...ars];
     if (curves.length>=2) { sk.addConstraint('tangent',[curves[0],curves[1]]); return null; }

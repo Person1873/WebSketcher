@@ -30,7 +30,10 @@ export function solvePlanegcs(sk) {
       }
       for (const c of sk.constraints) {
         const gc=toGcsConstraint(c);
-        if (gc) try { gcs.push_primitive(gc); } catch(e){console.warn('[planegcs] skip constraint',c.type,e.message);}
+        if (!gc) continue;
+        const list=Array.isArray(gc)?gc:[gc];
+        for (const g of list)
+          try { gcs.push_primitive(g); } catch(e){console.warn('[planegcs] skip constraint',c.type,e.message);}
       }
 
       if (sk._dragFixed && sk._dragTarget) {
@@ -40,7 +43,10 @@ export function solvePlanegcs(sk) {
           p1_id:sk._dragFixed.id, p2_id:'__drag_pt__', driving:true, temporary:true});
       }
 
-      const status=gcs.solve();
+      const algo = sk._dragFixed
+        ? (pg.Algorithm?.LevenbergMarquardt ?? 1)
+        : (pg.Algorithm?.DogLeg ?? 2);
+      const status=gcs.solve(algo);
       gcs.apply_solution();
 
       for (const [id,p] of sk.points) {
@@ -75,11 +81,7 @@ export function solvePlanegcs(sk) {
   try {
     const r = doSolve();
 
-    let dof=0;
-    for (const p of sk.points.values()) if (!p.reserved) dof+=2;
-    for (const ci of sk.circles.values()) dof+=1;
-    for (const a  of sk.arcs.values())   dof+=1;
-    for (const c  of sk.constraints)     dof-=c.dofCost;
+    const dof = sk.dof;
 
     return {status: r.status==='conflict'?'conflict': r.status==='near_miss'?'near_miss':'ok',
             dof, residualMM:0, redundantIds: r.redundantIds};

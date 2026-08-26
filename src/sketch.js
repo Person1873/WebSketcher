@@ -20,6 +20,13 @@ export class Sketch {
   _beginBatch() { this._batchDepth = (this._batchDepth||0) + 1; }
   _endBatch()   { if (--this._batchDepth === 0) this._solveAndNotify(); }
 
+  _dofConflict() {
+    for (const p of this.points.values()) if (!p.reserved && p.dof < 0) return true;
+    for (const ci of this.circles.values()) if (ci.dof < 0) return true;
+    for (const a of this.arcs.values()) if (a.dof < 0) return true;
+    return false;
+  }
+
   _solveAndNotify() {
     const r=solve(this); this.solveResult=r;
     const degenerate=this._checkDegenerate();
@@ -124,7 +131,7 @@ export class Sketch {
     const sk = this;
     c.delete();
     this._undoStack.push(()=>{
-      c._sketch = sk;
+      c._reattach(sk);
       sk.constraints.push(c);
       for (const r of c.refs) r._constraints?.add(c);
       sk._solveAndNotify();
@@ -139,7 +146,11 @@ export class Sketch {
     const afterSet = new Set(sk.constraints);
     const deletedConstraints = constraintsBefore.filter(c => !afterSet.has(c));
     this._undoStack.push(() => {
+      e._sketch = sk;
       switch(e.type) {
+        case 'point':
+          sk.points.set(e.id, e);
+          break;
         case 'line':
           sk.lines.set(e.id, e);
           e.p1.lines.add(e); e.p2.lines.add(e);
@@ -152,10 +163,12 @@ export class Sketch {
           sk.arcs.set(e.id, e);
           e.centre.circles.add(e);
           e.startPt.circles.add(e); e.endPt.circles.add(e);
+          e.startPt._consumedDof.set(e,1);
+          e.endPt._consumedDof.set(e,1);
           break;
       }
       for (const c of deletedConstraints) {
-        c._sketch = sk;
+        c._reattach(sk);
         sk.constraints.push(c);
         for (const r of c.refs) r._constraints?.add(c);
       }
@@ -165,10 +178,26 @@ export class Sketch {
   }
   setConstraintValue(c,v){ const old=c.value; c.value=v; this._undoStack.push(()=>{c.value=old;this._solveAndNotify();}); this._solveAndNotify(); }
 
+  get dof() {
+    let d=0;
+    for (const p of this.points.values())  if (!p.reserved) d+=Math.max(0,p.dof);
+    for (const ci of this.circles.values()) d+=Math.max(0,ci.dof);
+    for (const a of this.arcs.values())    d+=Math.max(0,a.dof);
+    return d;
+  }
+
   _mkPt(x,y,opts={}){ const name=opts.name??`Point ${++this._seq.point}`; const p=new SketchPoint(x,y,{...opts,name}); p._sketch=this; this.points.set(p.id,p); return p; }
   _mkLn(p1,p2,opts={}){ const name=opts.name??`Line ${++this._seq.line}`; const l=new SketchLine(p1,p2,{...opts,name}); l._sketch=this; this.lines.set(l.id,l); return l; }
   _mkCi(c,r,opts={}){ const name=opts.name??`Circle ${++this._seq.circle}`; const ci=new SketchCircle(c,r,{...opts,name}); ci._sketch=this; this.circles.set(ci.id,ci); return ci; }
-  _mkAr(centre,radius,startPt,endPt,opts={}){ const name=opts.name??`Arc ${++this._seq.arc}`; const a=new SketchArc(centre,radius,startPt,endPt,{...opts,name}); a._sketch=this; this.arcs.set(a.id,a); return a; }
+  _mkAr(centre,radius,startPt,endPt,opts={}){
+    const name=opts.name??`Arc ${++this._seq.arc}`;
+    const a=new SketchArc(centre,radius,startPt,endPt,{...opts,name});
+    a._sketch=this; this.arcs.set(a.id,a);
+    // Arc-internal: startPt and endPt are pinned to the circle by planegcs, each loses 1 DOF
+    startPt._consumedDof.set(a,1);
+    endPt._consumedDof.set(a,1);
+    return a;
+  }
   _mkC(type,refs,value,driven){ const c=makeConstraint(type,refs,value,driven); c._attachToSketch(this); this.constraints.push(c); return c; }
   _snapPos(){
     const s={};
@@ -217,7 +246,7 @@ export class Sketch {
       if(a.throughPt) arc.throughPt=byId[a.throughPt]??null;
     }
     for(const c of (j.constraints??[])){
-      const refs=c.refs.map(r=>byId[r]).filter(Boolean); if(!refs.length) continue;
+      const refs=c.refs.map(r=>byId[r]).filter(Boolean); if(refs.length!==c.refs.length) continue;
       const nc=sk._mkC(c.type,refs,c.value,c.driven);
       nc.locked=c.locked; nc.disabled=!!c.disabled; nc.name=c.name; nc.varRef=c.varRef??null;
       nc.id=c.id;

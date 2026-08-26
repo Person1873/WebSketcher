@@ -32,12 +32,27 @@ export function applyDir(rp1, rp2, p1, p2, fs, perp = false) {
   }
 }
 
+// --- DOF resolution helpers ---
+// More DOF = driven (less constrained). Tie = second entity (b) is driven (a was selected first = driver).
+function _pickDrivenPt(a, b)  { return a.dof > b.dof ? a : b; }
+function _lineDof(l)           { return l.p1.dof + l.p2.dof; }
+function _lineDrivenPt(l)      { return l.p1.dof > l.p2.dof ? l.p1 : l.p2; }
+function _curveDof(e)          { return e.type === 'line' ? _lineDof(e) : (e.centre?.dof ?? 0) + e.dof; }
+
 class Constraint {
-  constructor({ refs, value = null, driven = false, locked = false }) {
+  constructor({ refs, value = null, driven = false, locked = false, scale = 1 }) {
     this.id = genId(); this.refs = refs; this.value = value;
     this.driven = driven; this.locked = locked; this.disabled = false;
+    this.scale = scale;
     this.name = null; this._sketch = null; this.varRef = null;
+    this._drivenEntity = null; this._drivenCost = 0;
     for (const r of refs) r._constraints?.add(this);
+    if (!driven) this._setupDriven();
+  }
+  _setupDriven() {}
+  _consumeFrom(entity, cost) {
+    this._drivenEntity = entity; this._drivenCost = cost;
+    entity?._consumedDof?.set(this, cost);
   }
   get dofCost()     { return this.driven ? 0 : this._dofCost; }
   get _dofCost()    { return 1; }
@@ -51,13 +66,21 @@ class Constraint {
     if (remaining < this._minRefs) this.delete();
   }
   delete() {
-    if (!this._sketch) return;
     for (const r of this.refs) r._constraints?.delete(this);
+    this._drivenEntity?._consumedDof?.delete(this);
+    this._drivenEntity = null;
+    if (!this._sketch) return;
     this._sketch.constraints = this._sketch.constraints.filter(c => c !== this);
     this._sketch.markDirty();
     this._sketch = null;
   }
   _attachToSketch(sk) { this._sketch = sk; }
+  // Re-consume DOF when constraint is re-attached (undo)
+  _reattach(sk) {
+    this._sketch = sk;
+    if (this._drivenEntity && this._drivenCost)
+      this._drivenEntity._consumedDof?.set(this, this._drivenCost);
+  }
 }
 
 class DimensionalConstraint extends Constraint {
@@ -74,12 +97,16 @@ class GeometricConstraint extends Constraint {
 class CoincidentConstraint extends GeometricConstraint {
   get type() { return 'coincident'; } get _dofCost() { return 2; }
   get description() { return `${this.refs[0].name} = ${this.refs[1].name}`; }
+  _setupDriven() {
+    const [p1, p2] = this.refs;
+    this._consumeFrom(_pickDrivenPt(p1, p2), 2);
+  }
   _apply(fs) {
     const [p1, p2] = this.refs, f1 = fs.has(p1), f2 = fs.has(p2);
     if (f1 && f2) return;
-    if (f1)      { p2.x = p1.x; p2.y = p1.y; }
+    if (f1) { p2.x = p1.x; p2.y = p1.y; }
     else if (f2) { p1.x = p2.x; p1.y = p2.y; }
-    else { const mx = (p1.x + p2.x) / 2, my = (p1.y + p2.y) / 2; p1.x = mx; p1.y = my; p2.x = mx; p2.y = my; }
+    else { p1.x = p2.x = (p1.x + p2.x) / 2; p1.y = p2.y = (p1.y + p2.y) / 2; }
   }
 }
 
@@ -88,6 +115,11 @@ class HorizontalConstraint extends GeometricConstraint {
   get description() {
     if (this.refs.length === 2) return `${this.refs[0].name} ↔ ${this.refs[1].name} horizontal`;
     return `${this.refs[0].name} horizontal`;
+  }
+  _setupDriven() {
+    const pts = this.refs[0].type === 'line'
+      ? [this.refs[0].p1, this.refs[0].p2] : [this.refs[0], this.refs[1]];
+    this._consumeFrom(_pickDrivenPt(pts[0], pts[1]), 1);
   }
   _apply(fs) {
     if (this.refs.length === 2) {
@@ -112,6 +144,11 @@ class VerticalConstraint extends GeometricConstraint {
     if (this.refs.length === 2) return `${this.refs[0].name} ↕ ${this.refs[1].name} vertical`;
     return `${this.refs[0].name} vertical`;
   }
+  _setupDriven() {
+    const pts = this.refs[0].type === 'line'
+      ? [this.refs[0].p1, this.refs[0].p2] : [this.refs[0], this.refs[1]];
+    this._consumeFrom(_pickDrivenPt(pts[0], pts[1]), 1);
+  }
   _apply(fs) {
     if (this.refs.length === 2) {
       const [p1, p2] = this.refs, f1 = fs.has(p1), f2 = fs.has(p2);
@@ -132,18 +169,36 @@ class VerticalConstraint extends GeometricConstraint {
 class ParallelConstraint extends GeometricConstraint {
   get type() { return 'parallel'; }
   get description() { return `${this.refs[0].name} ∥ ${this.refs[1].name}`; }
+  _setupDriven() {
+    const [l1, l2] = this.refs;
+    const driven = _lineDof(l1) > _lineDof(l2) ? l1 : l2;
+    this._consumeFrom(_lineDrivenPt(driven), 1);
+  }
   _apply(fs) { const [a, b] = this.refs; applyDir(a.p1, a.p2, b.p1, b.p2, fs, false); }
 }
 
 class PerpendicularConstraint extends GeometricConstraint {
   get type() { return 'perpendicular'; }
   get description() { return `${this.refs[0].name} ⊥ ${this.refs[1].name}`; }
+  _setupDriven() {
+    const [l1, l2] = this.refs;
+    const driven = _lineDof(l1) > _lineDof(l2) ? l1 : l2;
+    this._consumeFrom(_lineDrivenPt(driven), 1);
+  }
   _apply(fs) { const [a, b] = this.refs; applyDir(a.p1, a.p2, b.p1, b.p2, fs, true); }
 }
 
 class EqualConstraint extends GeometricConstraint {
   get type() { return 'equal'; }
   get description() { return `${this.refs[0].name} = ${this.refs[1].name}`; }
+  _setupDriven() {
+    const [a, b] = this.refs;
+    const da = a.type === 'line' ? _lineDof(a) : a.dof;
+    const db = b.type === 'line' ? _lineDof(b) : b.dof;
+    const driven = da > db ? a : b;
+    if (driven.type === 'line') this._consumeFrom(_lineDrivenPt(driven), 1);
+    else                        this._consumeFrom(driven, 1);
+  }
   _apply(fs) {
     const [a, b] = this.refs;
     const dx1 = a.p2.x - a.p1.x, dy1 = a.p2.y - a.p1.y;
@@ -157,12 +212,19 @@ class FixedConstraint extends GeometricConstraint {
   constructor(a) { super(a); this.fx = a.refs[0].x; this.fy = a.refs[0].y; }
   get type() { return 'fixed'; } get _dofCost() { return 2; }
   get description() { return `${this.refs[0].name} fixed`; }
+  _setupDriven() { this._consumeFrom(this.refs[0], 2); }
   _apply() { this.refs[0].x = this.fx; this.refs[0].y = this.fy; }
 }
 
 class TangentConstraint extends GeometricConstraint {
   get type() { return 'tangent'; }
   get description() { return `${this.refs[0].name} ⌒ ${this.refs[1].name}`; }
+  _setupDriven() {
+    const [a, b] = this.refs;
+    const driven = _curveDof(a) > _curveDof(b) ? a : b;
+    if (driven.type === 'line') this._consumeFrom(_lineDrivenPt(driven), 1);
+    else                        this._consumeFrom(driven.centre, 1);
+  }
   _apply(fs) {
     const [a, b] = this.refs, ta = a.type, tb = b.type;
     if (ta === 'line' && (tb === 'circle' || tb === 'arc')) this._lc(a, b, fs);
@@ -198,6 +260,10 @@ class TangentConstraint extends GeometricConstraint {
 class SymmetricConstraint extends GeometricConstraint {
   get type() { return 'symmetric'; } get _dofCost() { return 2; }
   get description() { return `${this.refs[0].name} ↔ ${this.refs[1].name} about ${this.refs[2].name}`; }
+  _setupDriven() {
+    const [p1, p2] = this.refs;
+    this._consumeFrom(_pickDrivenPt(p1, p2), 2);
+  }
   _apply(fs) {
     const [p1, p2, ax] = this.refs, f1 = fs.has(p1), f2 = fs.has(p2), fa = fs.has(ax);
     if (f1 && f2 && fa) return;
@@ -223,6 +289,11 @@ class SymmetricConstraint extends GeometricConstraint {
 class PointOnLineConstraint extends GeometricConstraint {
   get type() { return 'point_on_line'; }
   get description() { return `${this.refs[0].name} on ${this.refs[1].name}`; }
+  _setupDriven() {
+    const [pt, line] = this.refs;
+    if (pt.dof > 0) this._consumeFrom(pt, 1);
+    else            this._consumeFrom(_lineDrivenPt(line), 1);
+  }
   _apply(fs) {
     const [pt, line] = this.refs; if (fs.has(pt)) return;
     const { p1, p2 } = line, dx = p2.x - p1.x, dy = p2.y - p1.y, lsq = dx * dx + dy * dy;
@@ -235,6 +306,11 @@ class PointOnLineConstraint extends GeometricConstraint {
 class PointOnCircleConstraint extends GeometricConstraint {
   get type() { return 'point_on_circle'; }
   get description() { return `${this.refs[0].name} on ${this.refs[1].name}`; }
+  _setupDriven() {
+    const [pt, ci] = this.refs;
+    if (pt.dof > 0) this._consumeFrom(pt, 1);
+    else            this._consumeFrom(ci, 1);
+  }
   _apply(fs) {
     const [pt, ci] = this.refs;
     const dx = pt.x - ci.centre.x, dy = pt.y - ci.centre.y;
@@ -247,11 +323,44 @@ class PointOnCircleConstraint extends GeometricConstraint {
   }
 }
 
+class PointOnArcConstraint extends GeometricConstraint {
+  get type() { return 'point_on_arc'; }
+  get description() { return `${this.refs[0].name} on ${this.refs[1].name}`; }
+  _setupDriven() {
+    const [pt, arc] = this.refs;
+    if (pt.dof > 0) this._consumeFrom(pt, 1);
+    else            this._consumeFrom(arc, 1);
+  }
+  _apply(fs) {
+    const [pt, arc] = this.refs;
+    if (fs.has(pt)) return;
+    const dx = pt.x - arc.centre.x, dy = pt.y - arc.centre.y;
+    const d = Math.sqrt(dx * dx + dy * dy); if (d < 1e-10) return;
+    const ta = Math.atan2(dy, dx);
+    const sa = arc.startAngle, ea = arc.endAngle;
+    const span = ((ea - sa) + 2*Math.PI) % (2*Math.PI);
+    const tFromSa = ((ta - sa) + 2*Math.PI) % (2*Math.PI);
+    if (tFromSa <= span) {
+      pt.x = arc.centre.x + (dx / d) * arc.radius;
+      pt.y = arc.centre.y + (dy / d) * arc.radius;
+    } else {
+      const distToStart = Math.min(tFromSa, 2*Math.PI - tFromSa);
+      const distToEnd   = Math.min(Math.abs(tFromSa - span), 2*Math.PI - Math.abs(tFromSa - span));
+      if (distToStart <= distToEnd) { pt.x = arc.startPt.x; pt.y = arc.startPt.y; }
+      else                          { pt.x = arc.endPt.x;   pt.y = arc.endPt.y;   }
+    }
+  }
+}
+
 class DistanceConstraint extends DimensionalConstraint {
   get type() { return 'distance'; }
   get description() {
     const v = this.solvedValue, s = v == null ? '?' : `${(v * 0.01).toFixed(2)}mm`;
     return this.refs.length === 1 ? `${this.refs[0].name} = ${s}` : `${this.refs[0].name}↔${this.refs[1].name} = ${s}`;
+  }
+  _setupDriven() {
+    if (this.refs[0].type === 'line') this._consumeFrom(_lineDrivenPt(this.refs[0]), 1);
+    else                              this._consumeFrom(_pickDrivenPt(this.refs[0], this.refs[1]), 1);
   }
   _apply(fs) {
     if (this.refs.length === 1) adjLen(this.refs[0].p1, this.refs[0].p2, this.value, fs);
@@ -269,6 +378,7 @@ class RadiusConstraint extends DimensionalConstraint {
     const v = this.solvedValue, s = v == null ? '?' : `${(v * 0.01).toFixed(2)}mm`;
     return `${this.refs[0].name} r=${s}`;
   }
+  _setupDriven() { this._consumeFrom(this.refs[0], 1); }
   _apply() { this.refs[0].radius = this.value; }
   _computeSolvedValue() { return this.refs[0].radius; }
 }
@@ -278,6 +388,15 @@ class AngleConstraint extends DimensionalConstraint {
   get description() {
     const v = this.solvedValue, s = v == null ? '?' : `${v.toFixed(1)}°`;
     return this.refs.length === 1 ? `${this.refs[0].name} ∠${s}` : `${this.refs[0].name}∠${this.refs[1].name}=${s}`;
+  }
+  _setupDriven() {
+    if (this.refs.length === 1) {
+      this._consumeFrom(_lineDrivenPt(this.refs[0]), 1);
+    } else {
+      const [l1, l2] = this.refs;
+      const driven = _lineDof(l1) > _lineDof(l2) ? l1 : l2;
+      this._consumeFrom(_lineDrivenPt(driven), 1);
+    }
   }
   _apply(fs) { this.refs.length === 1 ? this._abs(fs) : this._rel(fs); }
   _abs(fs) {
@@ -313,6 +432,7 @@ const CREG = {
   parallel: ParallelConstraint, perpendicular: PerpendicularConstraint, equal: EqualConstraint,
   fixed: FixedConstraint, tangent: TangentConstraint, symmetric: SymmetricConstraint,
   point_on_line: PointOnLineConstraint, point_on_circle: PointOnCircleConstraint,
+  point_on_arc: PointOnArcConstraint,
   distance: DistanceConstraint, radius: RadiusConstraint, angle: AngleConstraint,
 };
 

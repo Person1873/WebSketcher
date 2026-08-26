@@ -1,7 +1,7 @@
 import { C, CICONS } from '../geometry/analysis.js';
 import { BTN_SMALL } from './styles.js';
 
-export default function ConstraintList({sk, sel, onDelete, onToggleLocked, onToggleDisabled, onEdit}) {
+export default function ConstraintList({sk, sel, onDelete, onToggleLocked, onToggleDisabled, onToggleDriven, onEdit}) {
   const cs=sk.constraints;
   const sorted=[...cs].sort((a,b)=>{
     const aRel=a.refs.some(r=>sel.has(r.id));
@@ -29,7 +29,12 @@ export default function ConstraintList({sk, sel, onDelete, onToggleLocked, onTog
               flex:1,overflow:'hidden',whiteSpace:'nowrap',textOverflow:'ellipsis'}}>
               {c.description}{c.disabled?' (off)':''}
             </span>
-            {dim&&onEdit&&(
+            {dim&&onToggleDriven&&(
+              <button onClick={()=>onToggleDriven(c)} title={c.driven?'Make driving':'Make reference'}
+                style={{...BTN_SMALL,color:c.driven?C.driven:C.muted,fontSize:11,fontWeight:700,
+                  letterSpacing:'0.05em'}}>REF</button>
+            )}
+            {dim&&onEdit&&!c.driven&&(
               <button onClick={()=>onEdit(c)} title="Edit value"
                 style={{...BTN_SMALL,color:c.disabled?C.muted:'#5090d0',fontSize:14}}>✎</button>
             )}
